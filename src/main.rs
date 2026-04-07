@@ -1,52 +1,45 @@
-use dotenv_codegen::dotenv;
-use http_body_util::Full;
-use hyper::{
-    body::{Bytes, Incoming},
-    server::conn::http1,
-    Method, Request, Response, StatusCode,
-};
-use hyper_util::rt::TokioIo;
-use std::{convert::Infallible, error::Error, fs, net::SocketAddr};
-use tokio::net::TcpListener;
-use tower::ServiceBuilder;
+use axum::{http::StatusCode, response::Html, routing::get, Router};
+use axum_server::tls_rustls::RustlsConfig;
+use const_format::formatcp;
+use dotenvy_macro::dotenv;
+use std::{fs, net::SocketAddr};
 
-mod logger;
-use logger::Logger;
+const HTTPS_PORT: u16 = 8443;
 
-const MAIN_PAGE_PATH: &'static str = dotenv!("MAIN_PAGE_REL_PATH");
-const NOTFOUND_PAGE_PATH: &'static str = dotenv!("NOTFOUND_PAGE_REL_PATH");
+const CERT_PATH: &'static str = dotenv!("CERT_PATH");
+const PRIVATE_KEY_PATH: &'static str = dotenv!("PRIVATE_KEY_PATH");
+
+const MAIN_PAGE_PATH: &'static str = env!("MAIN_PAGE_PATH");
+const NOT_FOUND_PAGE_PATH: &'static str = env!("NOT_FOUND_PAGE_PATH");
+
+macro_rules! HTML_from_path {
+    ($const_path:path) => {
+        Html(
+            fs::read_to_string($const_path)
+                .expect(formatcp!("{} is invalid", stringify!($const_path))),
+        )
+    };
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    let listener = TcpListener::bind(addr).await?;
+async fn main() {
+    // TODO : HSTS
+    let app = Router::new()
+        .route("/", get(HTML_from_path!(MAIN_PAGE_PATH)))
+        .fallback((StatusCode::NOT_FOUND, HTML_from_path!(NOT_FOUND_PAGE_PATH)));
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        tokio::task::spawn(async move {
-            let svc = hyper::service::service_fn(handle_request);
-            let svc = ServiceBuilder::new().layer_fn(Logger::new).service(svc);
-            if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
-                eprintln!("server error: {}", err);
-            }
-        });
-    }
-}
+    let tls_config = RustlsConfig::from_pem_file(CERT_PATH, PRIVATE_KEY_PATH)
+        .await
+        .expect(formatcp!(
+            "Please export {} and {}",
+            stringify!(CERT_PATH),
+            stringify!(PRIVATE_KEY_PATH)
+        ));
 
-async fn handle_request(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/") => Ok(Response::new(full_html(MAIN_PAGE_PATH))),
-        _ => {
-            let mut not_found = Response::new(full_html(NOTFOUND_PAGE_PATH));
-            *not_found.status_mut() = StatusCode::NOT_FOUND;
-            Ok(not_found)
-        }
-    }
-}
+    let addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
 
-fn full_html(path: &'static str) -> Full<Bytes> {
-    let page = fs::read_to_string(path).expect(&format!("{path} does not exist!"));
-    let page = Bytes::from(page);
-    Full::new(page)
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
